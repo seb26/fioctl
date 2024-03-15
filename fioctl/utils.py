@@ -1,15 +1,19 @@
 from datetime import datetime
+from functools import partial
+from typing import Callable
 import itertools
 import json
 import time
 import click
 import concurrent.futures
+import re
 import os
 import sys
 import math
 import heapq
 import urllib
 import threading
+import logging
 from tqdm import tqdm
 from tabulate import tabulate
 from token_bucket import Limiter
@@ -21,6 +25,7 @@ from .config import config as fio_config
 
 TRUNCATION_CUTOFF = 100
 
+logger = logging.getLogger(__name__)
 
 def truncate_string(string):
     if not isinstance(string, str):
@@ -165,6 +170,31 @@ class FormatType(click.ParamType):
         return [tableize_row(row) for row in l]
 
 
+class RegexType(click.ParamType):
+    name = "regex"
+
+    def convert(self, pattern, _param, _ctx):
+        try:
+            r = re.compile(pattern)
+            search = partial(
+                re.search,
+                pattern
+            )
+            return search
+        except re.error as e:
+            click.ParamType.fail(f'Not a valid regex, check the string: {pattern}')
+
+
+def create_include_exclude_filter(user_re_include, user_re_exclude):
+    re_include = user_re_include if user_re_include else lambda value: True
+    re_exclude = user_re_exclude if user_re_exclude else lambda value: True
+    def _callable(value):
+        if re_include(value) and not re_exclude(value):
+            return True
+        return False
+    return _callable
+
+
 def merge_streams(*streams, key=lambda x: x["id"]):
     heap = []
     fetch = lambda stream: next(stream, None)
@@ -273,12 +303,20 @@ def chunker(iterable, n):
         yield chunk
 
 
-def stream_fs(root):
+def stream_fs(root, filter_d, filter_f):
     for directory, subdirs, files in os.walk(root):
-        for folder in subdirs:
-            yield ("d", os.path.join(directory, folder))
+        for d in subdirs:
+            if filter_d(d):
+                logger.debug(f'Filter - OK: {d}')
+                yield ("d", os.path.join(directory, d))
+            else:
+                logger.debug(f'Filter - Skipped: {d}')
         for f in files:
-            yield ("f", os.path.join(directory, f))
+            if filter_f(f):
+                logger.debug(f'Filter - OK: {f}')
+                yield ("f", os.path.join(directory, f))
+            else:
+                logger.debug(f'Filter - Skipped: {f}')
 
 
 def retry(callable, *args, **kwargs):

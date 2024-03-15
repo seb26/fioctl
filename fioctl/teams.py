@@ -27,6 +27,7 @@ def list(account_id, format, columns):
 
 
 @teams.command(help="List all teams you're a member of")
+@click.argument("team_id", required=False)
 @click.option("--format", type=utils.FormatType(), default="table")
 @click.option("--columns", type=utils.ListType(), default=DEFAULT_COLS)
 def get(team_id, format, columns):

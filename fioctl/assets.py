@@ -1,6 +1,7 @@
 import os
 import click
 import urllib
+import re
 import time
 import sys
 import mimetypes
@@ -145,36 +146,100 @@ def unversion(asset_id, format, columns):
 
 @assets.command(help="Uploads an asset with a given file")
 @click.argument("parent_id")
-@click.argument("file", type=click.Path(exists=True))
+@click.argument("disk_item", type=click.Path(exists=True))
 @click.option("--values", type=utils.UpdateType())
 @click.option("--format", type=utils.FormatType(), default="table")
 @click.option("--columns", type=utils.ListType(), default=DEFAULT_COLS)
+@click.option(
+    "--contents-only",
+    is_flag=True,
+    help="When using --recursive with a folder on disk, upload contents directly into the specified remote folder (`parent_id`) without creating a subfolder",
+)
+@click.option(
+    "--include-files",
+    type=utils.RegexType(),
+    help="Regex pattern to include disk files from being uploaded. Applies only to files found beneath the disk items.)",
+)
+@click.option(
+    "--include-folders",
+    type=utils.RegexType(),
+    help="Regex pattern to include disk folders from being uploaded. Applies only to folders found beneath the disk items.)",
+)
+@click.option(
+    "--exclude-files",
+    type=utils.RegexType(),
+    help="Regex pattern to exclude disk files from being uploaded. Applies only to files found beneath the disk items.)",
+)
+@click.option(
+    "--exclude-folders",
+    type=utils.RegexType(),
+    help="Regex pattern to exclude disk folders from being uploaded. Applies only to folders found beneath the disk items.)",
+)
 @click.option(
     "--recursive",
     is_flag=True,
     help="Upload the contents of the specified folder and all (transitive) subfolders",
 )
-def upload(parent_id, file, values, format, columns, recursive):
+def upload(
+    parent_id,
+    disk_item,
+    values,
+    format,
+    columns,
+    recursive,
+    contents_only,
+    include_files,
+    include_folders,
+    exclude_files,
+    exclude_folders
+):
     client = fio_client()
     utils.initialize_tqdm()
-    if recursive:
+    if os.path.isfile(disk_item):
+        filename = os.path.basename(disk_item)
+        filesize = os.path.getsize(disk_item)
+        filetype = mimetypes.guess_type(disk_item)[0]
+
+        values = values or {}
+        values["name"] = filename
+        values["filesize"] = filesize
+        values["type"] = "file"
+        values["filetype"] = filetype
+
+        asset = create_asset(client, parent_id, values)
+        format(asset, cols=columns)
+        uploader.upload(asset, open(disk_item, "rb"))
+    elif os.path.isdir(disk_item):
+        if not recursive:
+            click.ParamType.fail("This item is a folder. To upload a folder and its contents, use --recursive", err=True)
+            return
+        filter_d = lambda pass_all: True
+        filter_f = lambda pass_all: True
+        if include_folders or exclude_folders:
+            filter_d = utils.create_include_exclude_filter(include_folders, exclude_folders)
+        if include_files or exclude_files:
+            filter_f = utils.create_include_exclude_filter(include_files, exclude_files)
         click.echo("Beginning recursive upload")
-        format(upload_stream(client, parent_id, file), cols=["source"] + columns)
-        return
-
-    filename = os.path.basename(file)
-    filesize = os.path.getsize(file)
-    filetype = mimetypes.guess_type(file)[0]
-
-    values = values or {}
-    values["name"] = filename
-    values["filesize"] = filesize
-    values["type"] = "file"
-    values["filetype"] = filetype
-
-    asset = create_asset(client, parent_id, values)
-    format(asset, cols=columns)
-    uploader.upload(asset, open(file, "rb"))
+        if contents_only:
+            # Disk contents will go directly into the remote parent folder without any subfolder
+            dest_parent_id = parent_id
+        else:
+            # Create a parent folder on the remote side, that takes the name of the input disk folder
+            folder_name = os.path.basename(disk_item)
+            asset = create_asset(
+                client, parent_id, {"type": "folder", "name": folder_name}
+            )
+            dest_parent_id = asset['id']
+        format(
+            upload_stream(
+                client,
+                dest_parent_id,
+                disk_item,
+                filter_d = filter_d,
+                filter_f = filter_f,
+            ),
+            cols = ["source"] + columns
+        )
 
 
 @assets.command(help="Downloads an asset")
@@ -360,8 +425,8 @@ def folder_stream(client, parent_id, root, recurse_vs=False):
             yield (name, asset)
 
 
-def upload_stream(client, parent_id, root, capacity=10):
-    directories = {root: parent_id}
+def upload_stream(client, parent_id, disk_item, filter_d, filter_f, capacity=10):
+    directories = {disk_item: parent_id}
     tracker = utils.PositionTracker(capacity)
 
     def create_folder(folder):
@@ -378,7 +443,7 @@ def upload_stream(client, parent_id, root, capacity=10):
         position = tracker.acquire()
         asset = upload_asset(client, parent_id, f, position)
         tracker.release(position)
-        asset["source"] = os.path.relpath(f, root)
+        asset["source"] = os.path.relpath(f, disk_item)
         return asset
 
     def handle_fs(fs):
@@ -386,6 +451,12 @@ def upload_stream(client, parent_id, root, capacity=10):
         return (create_folder, upload_file)[type == "f"](path)
 
     for _, result in utils.exec_stream(
-        handle_fs, utils.stream_fs(root), sync=lambda pair: pair[0] == "d"
+        handle_fs,
+        utils.stream_fs(
+            disk_item,
+            filter_d = filter_d,
+            filter_f = filter_f,
+        ),
+        sync=lambda pair: pair[0] == "d"
     ):
         yield result

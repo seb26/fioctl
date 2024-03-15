@@ -1,5 +1,6 @@
 from datetime import datetime
 from textwrap import dedent
+import logging
 
 import click
 
@@ -15,9 +16,12 @@ from .review_links import review_links
 from .teams import teams
 from .users import users
 
+logger = logging.getLogger(__name__)
 
 @click.group()
-def cli():
+@click.option('--debug', help='Enable debug logging to the stdout', is_flag=True)
+@click.pass_context
+def cli(ctx, debug: bool = False):
     """
     Frame.io on the Command Line
 
@@ -64,7 +68,14 @@ def cli():
 
     ```
     """
-
+    ctx.debug = debug
+    # Configure logging to stdout
+    level = logging.DEBUG if ctx.debug else logging.INFO
+    logging.basicConfig(
+        datefmt = '%H:%M:%S',
+        format = '%(asctime)s.%(msecs)03d | %(levelname)s | %(name)s.%(funcName)s | %(message)s',
+        level = level,
+    )
 
 @cli.command(help="Set up a profile for fioctl")
 def configure():
