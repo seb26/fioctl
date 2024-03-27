@@ -319,13 +319,15 @@ def stream_fs(root, filter_d, filter_f):
                 logger.debug(f'Filter - Skipped: {f}')
 
 
-def retry(callable, *args, **kwargs):
+def retry(callable, *args, max_retry_time_sec: int = 4, **kwargs):
+    retry_time_sleep = kwargs.pop['max_retry_time_sec']
     attempt = kwargs.pop("attempt", 0)
     try:
         callable(*args, **kwargs)
-    except:
-        click.echo(f"Retrying {sys.exc_info()[0]}")
-        time.sleep(min(0.5 * math.pow(2, attempt), 4))
+    except Exception as e:
+        sleep_sec = min(0.5 * math.pow(2, attempt), retry_time_sleep)
+        logger.warning(f"{e} - Retrying after {sleep_sec/60} min")
+        time.sleep(sleep_sec)
         kwargs["attempt"] = attempt + 1
         retry(callable, *args, **kwargs)
 

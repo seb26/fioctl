@@ -12,6 +12,8 @@ from . import utils
 from . import uploader
 from .fio import fio_client
 from .config import column_default
+from .uploader import FrameioUploader
+
 DEFAULT_COLS = column_default("assets", "id,name,type,project_id,filesize,private")
 
 @click.group()
@@ -310,15 +312,18 @@ def create_asset(client, parent_id, asset):
     return client._api_call("post", f"/assets/{parent_id}/children", asset)
 
 
-def upload_asset(client, parent_id, file, position=None):
-    filesize = os.path.getsize(file)
-    name = os.path.basename(file)
-    asset = {}
-    asset["name"] = name
-    asset["filesize"] = filesize
-    asset["type"] = "file"
-    asset = create_asset(client, parent_id, asset)
-    uploader.upload(asset, open(file, "rb"), position)
+def upload_asset(client, parent_id, filepath, position=None):
+    asset = create_asset(
+        client,
+        parent_id,
+        {
+            "name": os.path.basename(filepath),
+            "filesize": os.path.getsize(filepath),
+            "type": "file",
+        },
+    )
+    uploader = FrameioUploader(asset, filepath, position)
+    uploader.upload()
     return asset
 
 

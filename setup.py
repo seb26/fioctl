@@ -12,16 +12,17 @@ setup(name='fioctl',
       packages=['fioctl'],
       include_package_data=True,
       install_requires=[
+        'bitmath',
+        'cached-property',
         'Click==6.7',
+        'frameioclient==0.6.0',
+        'furl'
         'pyyaml',
         'requests',
-        'tqdm',
-        'frameioclient==0.6.0',
         'tabulate',
         'token-bucket',
+        'tqdm',
         'treelib',
-        'cached-property',
-        'furl'
       ],
       entry_points={
         'console_scripts': 'fioctl=fioctl.fioctl:cli'
