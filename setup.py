@@ -16,7 +16,7 @@ setup(name='fioctl',
         'cached-property',
         'Click==6.7',
         'frameioclient==0.6.0',
-        'furl'
+        'furl',
         'pyyaml',
         'requests',
         'tabulate',
