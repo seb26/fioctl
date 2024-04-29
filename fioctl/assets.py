@@ -75,7 +75,7 @@ def traverse(asset_id, format, columns):
     format(
         (
             asset
-            for _, asset in folder_stream(fio_client(), asset_id, "/", recurse_vs=True)
+            for _, asset in remote_folder_stream(fio_client(), asset_id, "/", recurse_vs=True)
         ),
         cols=columns,
         root=(f"Asset[id: {asset_id}]", asset_id),
@@ -398,12 +398,12 @@ def download_stream(client, parent_id, root, proxy=None, capacity=10):
         return (make_folder, download)[asset["_type"] == "file"](name, asset)
 
     for result in utils.parallelize(
-        make_asset, folder_stream(client, parent_id, root), capacity=capacity
+        make_asset, remote_folder_stream(client, parent_id, root), capacity=capacity
     ):
         yield result
 
 
-def folder_stream(client, parent_id, root, recurse_vs=False):
+def remote_folder_stream(client, parent_id, root, recurse_vs=False):
     sibling_counter = Counter()
     for asset in fio.stream_endpoint(f"/assets/{parent_id}/children"):
         name = os.path.join(root, asset["name"])
@@ -415,12 +415,12 @@ def folder_stream(client, parent_id, root, recurse_vs=False):
         if asset["_type"] == "folder":
             yield (name, asset)
 
-            for result in folder_stream(client, asset["id"], name):
+            for result in remote_folder_stream(client, asset["id"], name):
                 yield result
 
         if recurse_vs and asset["_type"] == "version_stack":
             yield (name, asset)
-            for result in folder_stream(
+            for result in remote_folder_stream(
                 client, asset["id"], os.path.join(name, "versions")
             ):
                 yield result
