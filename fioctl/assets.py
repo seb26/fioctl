@@ -1,12 +1,21 @@
-import os
-import click
-import urllib
-import re
-import time
-import sys
-import mimetypes
-from tqdm import tqdm
 from collections import Counter
+from functools import partial
+from rich.progress import (
+    BarColumn,
+    FileSizeColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeRemainingColumn,
+    TotalFileSizeColumn,
+    TransferSpeedColumn,
+)
+import click
+import logging
+import mimetypes
+import os
+
 from . import fio
 from . import utils
 from . import uploader
@@ -14,7 +23,20 @@ from .fio import fio_client
 from .config import column_default
 from .uploader import FrameioUploader
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_COLS = column_default("assets", "id,name,type,project_id,filesize,private")
+
+PROXY_TABLE = {
+    ("high", "stream"): ["h264_2160", "h264_1080_best"],
+    ("medium", "stream"): ["h264_720"],
+    ("low", "stream"): ["h264_540", "h264_360"],
+    ("high", "image"): ["image_high"],
+    ("medium", "image"): ["image_full"],
+    ("low", "image"): ["image_small"],
+}
+
+PROXY_CASCADE = ["high", "medium", "low"]
 
 @click.group()
 def assets():
@@ -196,51 +218,63 @@ def upload(
     exclude_folders
 ):
     client = fio_client()
-    utils.initialize_tqdm()
-    if os.path.isfile(disk_item):
-        filename = os.path.basename(disk_item)
-        filesize = os.path.getsize(disk_item)
-        filetype = mimetypes.guess_type(disk_item)[0]
-
-        values = values or {}
-        values["name"] = filename
-        values["filesize"] = filesize
-        values["type"] = "file"
-        values["filetype"] = filetype
-
-        asset = create_asset(client, parent_id, values)
-        format(asset, cols=columns)
-        uploader.upload(asset, open(disk_item, "rb"))
-    elif os.path.isdir(disk_item):
-        if not recursive:
-            click.ParamType.fail("This item is a folder. To upload a folder and its contents, use --recursive", err=True)
-            return
-        filter_d = lambda pass_all: True
-        filter_f = lambda pass_all: True
-        if include_folders or exclude_folders:
-            filter_d = utils.create_include_exclude_filter(include_folders, exclude_folders)
-        if include_files or exclude_files:
-            filter_f = utils.create_include_exclude_filter(include_files, exclude_files)
-        click.echo("Beginning recursive upload")
-        if contents_only:
-            # Disk contents will go directly into the remote parent folder without any subfolder
-            dest_parent_id = parent_id
-        else:
-            # Create a parent folder on the remote side, that takes the name of the input disk folder
-            folder_name = os.path.basename(disk_item)
-            asset = create_asset(
-                client, parent_id, {"type": "folder", "name": folder_name}
-            )
-            dest_parent_id = asset['id']
+    filter_d = lambda pass_all: True
+    filter_f = lambda pass_all: True
+    progress_columns = [
+        SpinnerColumn(finished_text="✅"),
+        TextColumn('[progress.description]{task.description}'),
+        TextColumn('|'),
+        TotalFileSizeColumn(),
+        TextColumn('|'),
+        BarColumn(),
+        TextColumn('|'),
+        TaskProgressColumn(),
+        TextColumn('|'),
+        TextColumn('Speed: '),
+        TransferSpeedColumn(),
+        TextColumn('|'),
+        TextColumn('Remaining: '),
+        TimeRemainingColumn(),
+        TextColumn('|'),
+    ]
+    progress_args = dict(
+        transient = False,
+    )
+    with Progress(*progress_columns, **progress_args) as progress:
+        if os.path.isdir(disk_item):
+            if not recursive:
+                click.ParamType.fail("This item is a folder. To upload a folder and its contents, use --recursive", err=True)
+                return
+            if include_folders or exclude_folders:
+                filter_d = utils.create_include_exclude_filter(include_folders, exclude_folders)
+            if include_files or exclude_files:
+                filter_f = utils.create_include_exclude_filter(include_files, exclude_files)
+            click.echo("Beginning recursive upload")
+            if contents_only:
+                # Disk contents will go directly into the remote parent folder without any subfolder
+                destination_parent_id = parent_id
+            else:
+                # Create a parent folder on the remote side, that takes the name of the input disk folder
+                folder_name = os.path.basename(disk_item)
+                asset = create_asset(
+                    client, parent_id, {"type": "folder", "name": folder_name}
+                )
+                destination_parent_id = asset['id']
+        elif os.path.isfile(disk_item):
+            # This file will go directly into the remote parent folder 
+            destination_parent_id = parent_id
+        result = upload_handler(
+            client,
+            destination_parent_id,
+            disk_item,
+            filter_d = filter_d,
+            filter_f = filter_f,
+            progress = progress,
+        )
+        # Legacy
         format(
-            upload_stream(
-                client,
-                dest_parent_id,
-                disk_item,
-                filter_d = filter_d,
-                filter_f = filter_f,
-            ),
-            cols = ["source"] + columns
+            result,
+            cols = ["source", "outcome"] + columns,
         )
 
 
@@ -272,7 +306,6 @@ def upload(
 @click.option("--format", type=utils.FormatType(), default="table")
 def download(asset_id, destination, proxy, recursive, format):
     client = fio_client()
-    utils.initialize_tqdm()
     if recursive:
         format(
             download_stream(client, asset_id, destination, proxy),
@@ -306,37 +339,6 @@ def set(asset_id, values, format, columns):
 def create(parent_id, values, format, columns):
     assets = fio_client()._api_call("post", f"/assets/{parent_id}/children", values)
     format(assets, cols=columns)
-
-
-def create_asset(client, parent_id, asset):
-    return client._api_call("post", f"/assets/{parent_id}/children", asset)
-
-
-def upload_asset(client, parent_id, filepath, position=None):
-    asset = create_asset(
-        client,
-        parent_id,
-        {
-            "name": os.path.basename(filepath),
-            "filesize": os.path.getsize(filepath),
-            "type": "file",
-        },
-    )
-    uploader = FrameioUploader(asset, filepath, position)
-    uploader.upload()
-    return asset
-
-
-PROXY_TABLE = {
-    ("high", "stream"): ["h264_2160", "h264_1080_best"],
-    ("medium", "stream"): ["h264_720"],
-    ("low", "stream"): ["h264_540", "h264_360"],
-    ("high", "image"): ["image_high"],
-    ("medium", "image"): ["image_full"],
-    ("low", "image"): ["image_small"],
-}
-
-PROXY_CASCADE = ["high", "medium", "low"]
 
 
 def filename(name, proxy, path=None):
@@ -430,38 +432,94 @@ def folder_stream(client, parent_id, root, recurse_vs=False):
             yield (name, asset)
 
 
-def upload_stream(client, parent_id, disk_item, filter_d, filter_f, capacity=10):
+def create_asset(client, parent_id, asset):
+    if not parent_id or not asset:
+        raise Exception(f'Both parent ID and asset must be specified - parent_id: {parent_id} | asset: {asset}')
+    return client._api_call("post", f"/assets/{parent_id}/children", asset)
+
+def upload_handler(client, parent_id, disk_item, filter_d, filter_f, capacity=10, progress: Progress = None):
     directories = {disk_item: parent_id}
     tracker = utils.PositionTracker(capacity)
 
-    def create_folder(folder):
-        parent_id = directories[os.path.dirname(folder)]
+    def update_progress(task = None, value = None, start: bool = False):
+        if start is True:
+            return progress.start_task(task)
+        else:
+            return progress.update(task, advance=value)
+
+    def create_folder(parent_id, folder):
+        parent_id = directories.get(os.path.dirname(folder))
         asset = create_asset(
-            client, parent_id, {"type": "folder", "name": os.path.basename(folder)}
+            client,
+            parent_id,
+            { "type": "folder", "name": os.path.basename(folder) },
         )
         directories[folder] = asset["id"]
         asset["source"] = folder
         return asset
 
-    def upload_file(f):
-        parent_id = directories.get(os.path.dirname(f))
+    def upload_file(parent_id, filepath, single_file: bool=False):
+        if not single_file:
+            # Look up the destination remote ID based on a flat map of the dir paths we are keeping
+            parent_id = directories.get(os.path.dirname(filepath))
+        name = os.path.basename(filepath)
+        filepath_display = os.path.relpath(filepath, disk_item)
+        if filepath_display == '.':
+            filepath_display = name
+        filesize = os.path.getsize(filepath)
+        filetype = mimetypes.guess_type(filepath)[0]
+        this_task = progress.add_task(description=filepath_display, total=filesize, start=False)
         position = tracker.acquire()
-        asset = upload_asset(client, parent_id, f, position)
+        asset = create_asset(
+            client,
+            parent_id,
+            {
+                "name": name,
+                "filesize": filesize,
+                "filetype": filetype,
+                "type": "file",
+            },
+        )
+        uploader = FrameioUploader(
+            asset,
+            filepath,
+            position,
+            progress_callback = partial(
+                update_progress,
+                this_task,
+            ),
+        )
+        result = uploader.upload()
         tracker.release(position)
-        asset["source"] = os.path.relpath(f, disk_item)
+        if result is True:
+            if single_file:
+                asset['source'] = filepath
+            else:
+                asset['source'] = os.path.relpath(filepath, disk_item)
+            asset['outcome'] = 'Succeeded'
+        else:
+            logger.warning(f'{name}: upload did not complete successfully')
+            asset['outcome'] = 'Failed'
         return asset
 
     def handle_fs(fs):
         type, path = fs
-        return (create_folder, upload_file)[type == "f"](path)
-
-    for _, result in utils.exec_stream(
-        handle_fs,
-        utils.stream_fs(
-            disk_item,
-            filter_d = filter_d,
-            filter_f = filter_f,
-        ),
-        sync=lambda pair: pair[0] == "d"
-    ):
+        return (create_folder, upload_file)[type == "f"](parent_id, path)
+    
+    if os.path.isfile(disk_item):
+        # For a single file, immediately start to upload it
+        result = upload_file(parent_id, disk_item, single_file=True)
         yield result
+
+    elif os.path.isdir(disk_item):
+        # Begin to stream the filesystem (os.walk) and create remote folder assets as we go
+        for _, result in utils.exec_stream(
+            handle_fs,
+            utils.stream_fs(
+                disk_item,
+                filter_d = filter_d,
+                filter_f = filter_f,
+            ),
+            sync=lambda pair: pair[0] == "d"
+        ):
+            yield result

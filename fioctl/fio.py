@@ -7,7 +7,7 @@ from .config import config as fioconf
 from .config import nested_get
 
 
-def fio_client(profile=None):
+def fio_client(profile=None) -> FrameioClient:
     profile = profile or fioconf.fetch("profiles", "default") or "default"
     token = fioconf.fetch(profile, "bearer_token")
     host = fioconf.fetch(profile, "host") or "https://api.frame.io"

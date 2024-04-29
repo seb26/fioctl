@@ -1,8 +1,8 @@
 from datetime import datetime
+from rich.logging import RichHandler
 from textwrap import dedent
-import logging
-
 import click
+import logging
 
 from . import fio
 from .accounts import accounts
@@ -75,6 +75,7 @@ def cli(ctx, debug: bool = False):
         datefmt = '%H:%M:%S',
         format = '%(asctime)s.%(msecs)03d | %(levelname)s | %(name)s.%(funcName)s | %(message)s',
         level = level,
+        handlers = [RichHandler()], # Support rich progress bars
     )
 
 @cli.command(help="Set up a profile for fioctl")

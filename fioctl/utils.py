@@ -1,24 +1,26 @@
 from datetime import datetime
 from functools import partial
-from typing import Callable
-import itertools
-import json
-import time
-import click
-import concurrent.futures
-import re
-import os
-import sys
-import math
-import heapq
-import urllib
-import threading
-import logging
-from tqdm import tqdm
+from rich.progress import Progress
 from tabulate import tabulate
 from token_bucket import Limiter
 from token_bucket import MemoryStorage
+from tqdm import tqdm
 from treelib import Node, Tree
+from typing import Callable
+import bitmath
+import click
+import concurrent.futures
+import heapq
+import itertools
+import json
+import logging
+import math
+import os
+import re
+import sys
+import threading
+import time
+import urllib
 
 from .config import nested_get, nested_set
 from .config import config as fio_config
@@ -320,7 +322,7 @@ def stream_fs(root, filter_d, filter_f):
 
 
 def retry(callable, *args, max_retry_time_sec: int = 4, **kwargs):
-    retry_time_sleep = kwargs.pop['max_retry_time_sec']
+    retry_time_sleep = max_retry_time_sec
     attempt = kwargs.pop("attempt", 0)
     try:
         callable(*args, **kwargs)
@@ -351,3 +353,38 @@ class PositionTracker(object):
     def release(self, position):
         with self.lock:
             self.used.remove(position)
+
+
+def update_progress(progress: Progress, task, value):
+    progress.update()
+
+
+def format_data_bytes(
+    bytes: int,
+    pl: int = 2
+) -> bitmath.Byte:
+    """
+    Given bytes, returns a formatted size with best units in 2 decimal places
+
+    :param pl: decimal places to format to
+    """
+    return bitmath.Byte(bytes).best_prefix(system=bitmath.SI).format(
+        '{value:.' + str(pl) + 'f} {unit}',
+    )
+
+
+def format_data_speed_bytes_sec(
+    bytes: int,
+    pl: int = 2,
+):
+    return f"{format_data_bytes(bytes, pl=pl)}/s"
+
+
+def format_data_speed_mbits_sec(
+    bytes: int,
+    pl: int = 2,
+):
+    """Always Megabits (and as 'Mbps') to indicate it is an Internet-related measurement"""
+    return bitmath.Byte(bytes).to_Mb().format(
+        '{value:.' + str(pl) + 'f} {unit}ps',
+    )
