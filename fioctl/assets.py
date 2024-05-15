@@ -1,25 +1,18 @@
 from collections import Counter
 from functools import partial
-from rich.progress import (
-    BarColumn,
-    FileSizeColumn,
-    Progress,
-    SpinnerColumn,
-    TaskProgressColumn,
-    TextColumn,
-    TimeRemainingColumn,
-    TotalFileSizeColumn,
-    TransferSpeedColumn,
-)
+from pathlib import Path
+from typing import Callable, List, Generator, Iterable, Tuple
 import click
 import logging
 import mimetypes
 import os
 
-from . import fio
+from rich.live import Live
+from rich.console import Group
+from rich.progress import Progress
+
 from . import utils
-from . import uploader
-from .fio import fio_client
+from .fio import fio_client, stream_endpoint
 from .config import column_default
 from .uploader import FrameioUploader
 
@@ -38,6 +31,45 @@ PROXY_TABLE = {
 
 PROXY_CASCADE = ["high", "medium", "low"]
 
+class QueuedAsset(object):
+    pass
+
+class QueuedAssetUpload(QueuedAsset):
+    def __init__(
+        self,
+        destination_id: str,
+        filepath: str | Path,
+        origin_path: str | Path,
+        type: str,
+        asset: dict = None,
+    ):
+        self.asset = asset
+        self.destination_id = destination_id
+        self.filepath = filepath
+        self.origin_path = origin_path
+        self.type = type
+        if self.type == 'f':
+            self.filesize = filepath.stat().st_size
+
+    def __str__(self):
+        return self.filepath
+
+class UploadQueue(object):
+    def __init__(self):
+        self.queue = []
+    
+    def add(self, item: QueuedAsset):
+        self.queue.append(item)
+        logger.debug(f'Added item to queue: {item.filepath}')
+
+    def remove(self, item: QueuedAsset):
+        self.queue.remove(item)
+
+    @property
+    def all(self) -> Generator:
+        return ( i for i in sorted(self.queue, key=lambda item: item.filepath) )
+
+
 @click.group()
 def assets():
     """Asset related commands"""
@@ -48,7 +80,7 @@ def assets():
 @click.option("--format", type=utils.FormatType(), default="table")
 @click.option("--columns", type=utils.ListType(), default=DEFAULT_COLS)
 def list(parent_id, format, columns):
-    assets = fio.stream_endpoint(f"/assets/{parent_id}/children")
+    assets = stream_endpoint(f"/assets/{parent_id}/children")
 
     format(assets, cols=columns)
 
@@ -169,10 +201,11 @@ def unversion(asset_id, format, columns):
 
 
 @assets.command(help="Uploads an asset with a given file")
+@click.pass_context
 @click.argument("parent_id")
-@click.argument("disk_item", type=click.Path(exists=True))
+@click.argument("disk_items", type=click.Path(exists=True, path_type=Path), nargs=-1, required=True)
 @click.option("--values", type=utils.UpdateType())
-@click.option("--format", type=utils.FormatType(), default="table")
+@click.option("--format", type=utils.FormatType(), default="none")
 @click.option("--columns", type=utils.ListType(), default=DEFAULT_COLS)
 @click.option(
     "--contents-only",
@@ -199,81 +232,118 @@ def unversion(asset_id, format, columns):
     type=utils.RegexType(),
     help="Regex pattern to exclude disk folders from being uploaded. Applies only to folders found beneath the disk items.)",
 )
-@click.option(
-    "--recursive",
-    is_flag=True,
-    help="Upload the contents of the specified folder and all (transitive) subfolders",
-)
 def upload(
+    ctx,
     parent_id,
-    disk_item,
+    disk_items: Iterable[Path],
     values,
     format,
     columns,
-    recursive,
     contents_only,
     include_files,
     include_folders,
     exclude_files,
     exclude_folders
-):
+): 
+    def handle_result(queued_asset, remote_asset) -> dict:
+        # Remove from queue
+        queue.remove(queued_asset)
+        # Mark that we have completed 1 item
+        progress_total.files_update(advance=1)
+        return remote_asset
+    
+    def on_filesize_uploaded(task, advance: int = 0):
+        progress_per_file.update(task, advance=advance)
+        progress_total.filesize_update(advance=advance)
+
+    if values:
+        click.ParamType.fail('Specifying `values` is not yet implemented for `fioctl assets upload`')
+
+    # FIO api client
     client = fio_client()
+
+    # Blank filters - to be overridden by user filters
     filter_d = lambda pass_all: True
     filter_f = lambda pass_all: True
-    progress_columns = [
-        SpinnerColumn(finished_text="✅"),
-        TextColumn('[progress.description]{task.description}'),
-        TextColumn('|'),
-        TotalFileSizeColumn(),
-        TextColumn('|'),
-        BarColumn(),
-        TextColumn('|'),
-        TaskProgressColumn(),
-        TextColumn('|'),
-        TextColumn('Speed: '),
-        TransferSpeedColumn(),
-        TextColumn('|'),
-        TextColumn('Remaining: '),
-        TimeRemainingColumn(),
-        TextColumn('|'),
-    ]
-    progress_args = dict(
-        transient = False,
+
+    # Store files/folders to upload
+    queue = UploadQueue()
+
+    # Progress bar from `rich.progress`
+    # PER FILE
+    progress_per_file = utils.TransferProgressItems(expand=True)
+    progress_total = utils.TransferProgressTotal('upload')
+
+    live_group = Group(
+        progress_per_file,
+        progress_total,
     )
-    with Progress(*progress_columns, **progress_args) as progress:
-        if os.path.isdir(disk_item):
-            if not recursive:
-                click.ParamType.fail("This item is a folder. To upload a folder and its contents, use --recursive", err=True)
-                return
-            if include_folders or exclude_folders:
-                filter_d = utils.create_include_exclude_filter(include_folders, exclude_folders)
-            if include_files or exclude_files:
-                filter_f = utils.create_include_exclude_filter(include_files, exclude_files)
-            click.echo("Beginning recursive upload")
-            if contents_only:
-                # Disk contents will go directly into the remote parent folder without any subfolder
-                destination_parent_id = parent_id
-            else:
-                # Create a parent folder on the remote side, that takes the name of the input disk folder
-                folder_name = os.path.basename(disk_item)
-                asset = create_asset(
-                    client, parent_id, {"type": "folder", "name": folder_name}
+
+    with Live(live_group):
+        logger.debug(f"Disk items: {disk_items}")
+
+        for disk_item in disk_items:
+            if disk_item.is_dir():
+                if include_folders or exclude_folders:
+                    filter_d = utils.create_include_exclude_filter(include_folders, exclude_folders)
+                if include_files or exclude_files:
+                    filter_f = utils.create_include_exclude_filter(include_files, exclude_files)
+                if contents_only:
+                    # Disk contents will go directly into the remote parent folder without any subfolder
+                    destination_parent_id = parent_id
+                else:
+                    # Create a parent folder on the remote side, that takes the name of the input disk folder
+                    folder_asset = create_asset(
+                        client, parent_id, {"type": "folder", "name": disk_item.name}
+                    )
+                    destination_parent_id = folder_asset['id']
+                # Look at the disk tree and queue items
+                stream = utils.stream_fs_pathlib(
+                    disk_item,
+                    filter_d = filter_d,
+                    filter_f = filter_f,
                 )
-                destination_parent_id = asset['id']
-        elif os.path.isfile(disk_item):
-            # This file will go directly into the remote parent folder 
-            destination_parent_id = parent_id
-        result = upload_handler(
+                for type, filepath in stream:
+                    # Add files and folders to the queue.
+                    # Folders: just the path is stored, creation of remote assets does not take place until
+                    # the queue is actually processed. 
+                    queued_item = QueuedAssetUpload(
+                        destination_id = destination_parent_id,
+                        filepath = filepath,
+                        origin_path = disk_item,
+                        type = type,
+                    )
+                    queue.add(queued_item)
+                    if type == 'f':
+                        # Don't increment folders
+                        progress_total.files_update(increment_total=1)
+                        progress_total.filesize_update(increment_total=queued_item.filesize)
+
+            elif disk_item.is_file():
+                queued_item = QueuedAssetUpload(
+                    destination_id = parent_id, # This file will go directly into the specified remote folder 
+                    filepath = disk_item,
+                    origin_path = disk_item.parent, # Its origin path is the parent folder
+                    type = 'f',
+                )
+                queue.add(queued_item)
+                progress_total.files_update(increment_total=1)
+                progress_total.filesize_update(increment_total=queued_item.filesize)
+        
+        if len(queue.queue) == 0:
+            ctx.exit()
+
+        # Go through the queue
+        upload = upload_handler(
             client,
-            destination_parent_id,
-            disk_item,
-            filter_d = filter_d,
-            filter_f = filter_f,
-            progress = progress,
+            queue = queue,
+            queued_items = queue.all,
+            progress = progress_per_file,
+            progress_callback = on_filesize_uploaded,
         )
-        # Legacy
+        results = [ handle_result(*u) for u in upload ]
         format(
-            result,
+            results,
             cols = ["source", "outcome"] + columns,
         )
 
@@ -314,6 +384,9 @@ def download(asset_id, destination, proxy, recursive, format):
         return
 
     asset = client._api_call("get", f"/assets/{asset_id}")
+    if asset['type'] == 'folder' and not recursive:
+        click.echo("This item is a folder. To download a folder and its contents, use --recursive", err=True)
+        return
     proxy, url = get_proxy(asset, proxy)
     destination = destination or filename(asset["name"], proxy)
     click.echo(f"Downloading to {destination}...")
@@ -405,7 +478,7 @@ def download_stream(client, parent_id, root, proxy=None, capacity=10):
 
 def remote_folder_stream(client, parent_id, root, recurse_vs=False):
     sibling_counter = Counter()
-    for asset in fio.stream_endpoint(f"/assets/{parent_id}/children"):
+    for asset in stream_endpoint(f"/assets/{parent_id}/children"):
         name = os.path.join(root, asset["name"])
         sibling_counter[name] += 1
         if sibling_counter[name] > 1:
@@ -437,36 +510,43 @@ def create_asset(client, parent_id, asset):
         raise Exception(f'Both parent ID and asset must be specified - parent_id: {parent_id} | asset: {asset}')
     return client._api_call("post", f"/assets/{parent_id}/children", asset)
 
-def upload_handler(client, parent_id, disk_item, filter_d, filter_f, capacity=10, progress: Progress = None):
-    directories = {disk_item: parent_id}
+
+def upload_handler(
+    client,
+    queue: UploadQueue,
+    queued_items: List,
+    progress: Progress,
+    progress_callback: Callable,
+    capacity: int = 5,
+):
+    directories = {}
     tracker = utils.PositionTracker(capacity)
 
     def update_progress(task = None, value = None, start: bool = False):
         if start is True:
             return progress.start_task(task)
         else:
-            return progress.update(task, advance=value)
+            return progress_callback(task, advance=value)
 
-    def create_folder(parent_id, folder):
-        parent_id = directories.get(os.path.dirname(folder))
+    def create_folder(parent_id, folder: Path, name: str):
+        parent_id = directories.get(folder.parent)
         asset = create_asset(
             client,
             parent_id,
-            { "type": "folder", "name": os.path.basename(folder) },
+            { "type": "folder", "name": name },
         )
         directories[folder] = asset["id"]
         asset["source"] = folder
         return asset
 
-    def upload_file(parent_id, filepath, single_file: bool=False):
-        if not single_file:
-            # Look up the destination remote ID based on a flat map of the dir paths we are keeping
-            parent_id = directories.get(os.path.dirname(filepath))
-        name = os.path.basename(filepath)
-        filepath_display = os.path.relpath(filepath, disk_item)
+    def upload_file(parent_id, filepath: Path, origin_path: Path):
+        # Look up the destination remote ID based on a flat map of the dir paths we are keeping
+        parent_id = directories.get(filepath.parent)
+        name = filepath.name
+        filepath_display = filepath.relative_to(origin_path)
         if filepath_display == '.':
             filepath_display = name
-        filesize = os.path.getsize(filepath)
+        filesize = filepath.stat().st_size
         filetype = mimetypes.guess_type(filepath)[0]
         this_task = progress.add_task(description=filepath_display, total=filesize, start=False)
         position = tracker.acquire()
@@ -492,34 +572,45 @@ def upload_handler(client, parent_id, disk_item, filter_d, filter_f, capacity=10
         result = uploader.upload()
         tracker.release(position)
         if result is True:
-            if single_file:
-                asset['source'] = filepath
-            else:
-                asset['source'] = os.path.relpath(filepath, disk_item)
+            asset['source'] = filepath.relative_to(origin_path)
             asset['outcome'] = 'Succeeded'
         else:
             logger.warning(f'{name}: upload did not complete successfully')
             asset['outcome'] = 'Failed'
         return asset
-
-    def handle_fs(fs):
-        type, path = fs
-        return (create_folder, upload_file)[type == "f"](parent_id, path)
     
-    if os.path.isfile(disk_item):
-        # For a single file, immediately start to upload it
-        result = upload_file(parent_id, disk_item, single_file=True)
+    def process_queued_item(item: QueuedAsset) -> dict:
+        # Check to see if this file now has a remote side parent folder that we can place it in
+        if directories.get(item.filepath.parent):
+            destination_id = directories.get(item.filepath.parent)
+        else:
+            # Initially set the origin path -> ID
+            directories[item.origin_path] = item.destination_id
+            destination_id = item.destination_id
+        if item.filepath.is_file():
+            return upload_file(
+                destination_id,
+                item.filepath,
+                origin_path = item.origin_path,
+            )
+        elif item.filepath.is_dir():
+            # Create the asset folder
+            folder = create_folder(
+                parent_id = destination_id,
+                folder = item.filepath,
+                name = item.filepath.name,
+            )
+            if not folder:
+                logger.error(f'Did not successfully create this folder asset on remote side: {item.filepath}')
+                return
+            # And store a relationship between that new asset ID and the dirpath
+            directories[item] = folder['id']
+            return folder
+    
+    for result in utils.exec_stream(
+        process_queued_item,
+        queued_items,
+        capacity = capacity,
+    ):
         yield result
 
-    elif os.path.isdir(disk_item):
-        # Begin to stream the filesystem (os.walk) and create remote folder assets as we go
-        for _, result in utils.exec_stream(
-            handle_fs,
-            utils.stream_fs(
-                disk_item,
-                filter_d = filter_d,
-                filter_f = filter_f,
-            ),
-            sync=lambda pair: pair[0] == "d"
-        ):
-            yield result

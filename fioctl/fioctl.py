@@ -70,10 +70,15 @@ def cli(ctx, debug: bool = False):
     """
     ctx.debug = debug
     # Configure logging to stdout
-    level = logging.DEBUG if ctx.debug else logging.INFO
+    if ctx.debug:
+        level = logging.DEBUG
+        format_string = '%(name)s.%(funcName)s | %(message)s'
+    else:
+        level = logging.INFO
+        format_string = '%(message)s'
     logging.basicConfig(
         datefmt = '%H:%M:%S',
-        format = '%(asctime)s.%(msecs)03d | %(levelname)s | %(name)s.%(funcName)s | %(message)s',
+        format = format_string,
         level = level,
         handlers = [RichHandler()], # Support rich progress bars
     )

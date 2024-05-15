@@ -1,6 +1,23 @@
 from datetime import datetime
-from functools import partial
-from rich.progress import Progress
+from functools import partialmethod
+from pathlib import Path
+from rich.console import Group
+from rich.panel import Panel
+from rich.progress import (
+    BarColumn,
+    Progress,
+    ProgressColumn,
+    SpinnerColumn,
+    TaskID,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+    TotalFileSizeColumn,
+    TransferSpeedColumn,
+)
+from rich.table import Column, Table
+from rich.text import Text
 from tabulate import tabulate
 from token_bucket import Limiter
 from token_bucket import MemoryStorage
@@ -79,7 +96,12 @@ class FormatType(click.ParamType):
             "table": self.format_table,
             "csv": self.format_csv,
             "tree": self.format_tree,
+            "none": self.format_no_output,
         }
+    
+    def format_no_output(self, value, **kwargs):
+        """No output, quiet"""
+        return
 
     def format_json(self, value, **kwargs):
         if isinstance(value, dict):
@@ -185,6 +207,110 @@ class RegexType(click.ParamType):
             return search
         except re.error as e:
             click.ParamType.fail(f'Not a valid regex, check the string: {pattern}')
+
+
+class TransferSpeedColumn(ProgressColumn):
+    """Renders human readable transfer speed."""
+
+    def render(self, task) -> Text:
+        """Show data transfer speed."""
+        speed = task.finished_speed or task.speed
+        if speed is None:
+            return Text('', style="progress.data.speed")
+        data_speed_bytes = format_data_speed_bytes_sec(int(speed))
+        data_speed_bits =format_data_speed_mbits_sec(int(speed))
+        return Text(f"{data_speed_bytes} ({data_speed_bits})", style="progress.data.speed")
+
+
+class TransferProgressItems(Progress):
+    columns = Progress(
+        SpinnerColumn(finished_text="✅"),
+        TextColumn('[progress.description]{task.description}'),
+        TextColumn('|'),
+        TotalFileSizeColumn(),
+        TextColumn('|'),
+        BarColumn(bar_width=None),
+        TextColumn('|'),
+        TaskProgressColumn(),
+        TextColumn('|'),
+        transient = True,
+    )
+
+    def get_renderables(self):
+        """Wrap it in a panel"""
+        table = self.make_tasks_table(self.tasks)
+        table.title = 'Files'
+        table.title_style = 'bold'
+        yield Panel(
+            table,
+        )
+
+
+class TransferProgressTotal(Progress):
+    def __init__(self, transfer_type: str, **kwargs):
+        super(TransferProgressTotal, self).__init__(**kwargs)
+        # Totals
+        self.files_count_id = self.add_task('total_files_num', total=0, start=False)
+        self.filesize_id = self.add_task('total_filesize', total=0)
+        self.files = self._tasks[self.files_count_id]
+        self.filesize = self._tasks[self.filesize_id]
+        self.transfer_type = transfer_type
+        if self.transfer_type == 'upload':
+            self.transfer_type_display = '⬆  Uploading'
+        elif self.transfer_type == 'download':
+            self.transfer_type_display = '⬇  Downloading'
+
+    
+    def files_update(self, **kwargs):
+        if kwargs.get('increment_total'):
+            task = self._tasks[self.files_count_id]
+            task.total += kwargs['increment_total']
+            return task.total
+        return self.update(self.files_count_id, **kwargs)
+    
+    def filesize_update(self, **kwargs):
+        if kwargs.get('increment_total'):
+            task = self._tasks[self.filesize_id]
+            task.total += kwargs['increment_total']
+            return task.total
+        return self.update(self.filesize_id, **kwargs)
+
+    def get_renderables(self):
+        if len(self.tasks) == 0:
+            return
+
+        table_topline = Table.grid(padding=(0, 1), expand=False)
+        table_topline.add_row(
+            Text(f'{self.transfer_type_display}'),
+            TransferSpeedColumn().render(task=self.filesize),
+        )
+        table_topline.row_styles = 'bold'
+        table_bar = Table.grid(padding=(0, 1), expand=True)
+        table_bar.add_row(
+            BarColumn(bar_width=None).render(task=self.filesize),
+        )
+        table_detailed = Table.grid(padding=(0, 1), expand=False)
+        table_detailed.add_row(
+            f'{self.files.completed} of {self.files.total} file(s) -',
+            f'{format_data_bytes(self.filesize.completed)} of {format_data_bytes(self.filesize.total)} -',
+            'Elapsed:',
+            TimeElapsedColumn().render(task=self.filesize),
+            ' - Remaining:',
+            TimeRemainingColumn().render(task=self.filesize),
+        )
+        progress_panel = Panel(
+            Group(
+                table_topline,
+                table_detailed,
+            )
+        )
+        yield progress_panel
+
+
+def increment_task_total(progress: Progress, task_id: int, advance: int=0):
+    task = progress._tasks[task_id]
+    task.total += advance
+    return task.total
 
 
 def create_include_exclude_filter(user_re_include, user_re_exclude):
@@ -320,6 +446,21 @@ def stream_fs(root, filter_d, filter_f):
             else:
                 logger.debug(f'Filter - Skipped: {f}')
 
+def stream_fs_pathlib(root: Path, filter_d, filter_f):
+    for directory, dirs, files in root.walk():
+        for d in dirs:
+            if filter_d(d):
+                logger.debug(f'Filter - OK: {d}')
+                yield ( 'd', directory.joinpath(d) )
+            else:
+                logger.debug(f'Filter - Skipped: {d}')
+        for f in files:
+            if filter_f(f):
+                logger.debug(f'Filter - OK: {f}')
+                yield ( 'f', directory.joinpath(f) )
+            else:
+                logger.debug(f'Filter - Skipped: {f}')
+
 
 def retry(callable, *args, max_retry_time_sec: int = 4, **kwargs):
     retry_time_sleep = max_retry_time_sec
@@ -353,10 +494,6 @@ class PositionTracker(object):
     def release(self, position):
         with self.lock:
             self.used.remove(position)
-
-
-def update_progress(progress: Progress, task, value):
-    progress.update()
 
 
 def format_data_bytes(

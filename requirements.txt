@@ -1,0 +1,29 @@
+analytics-python==1.4.post1
+backoff==1.10.0
+bitmath==1.3.3.1
+blessed==1.20.0
+cached-property==1.5.2
+certifi==2024.2.2
+charset-normalizer==3.3.2
+click==6.7
+enlighten==1.12.4
+-e git+ssh://git@github.com/seb26/fioctl.git@000f0d3fd35e7befec252b3b2e7c3a89e69ec913#egg=fioctl
+-e git+https://github.com/seb26/python-frameio-client@3bd52a42b13ea98ba5d200881baed8f1efe4b764#egg=frameioclient
+furl==2.1.3
+idna==3.7
+monotonic==1.6
+orderedmultidict==1.0.1
+prefixed==0.7.1
+python-dateutil==2.9.0.post0
+PyYAML==6.0.1
+requests==2.31.0
+Send2Trash==1.8.3
+six==1.16.0
+speedtest-cli==2.1.3
+tabulate==0.9.0
+token-bucket==0.3.0
+tqdm==4.66.2
+treelib==1.7.0
+urllib3==2.2.1
+wcwidth==0.2.13
+xxhash==3.4.1

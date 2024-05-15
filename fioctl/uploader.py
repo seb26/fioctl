@@ -1,3 +1,4 @@
+from pathlib import Path
 from rich.progress import Progress, TaskID
 from typing import List, Callable
 import concurrent.futures
@@ -15,7 +16,7 @@ thread_local = threading.local()
 logger = logging.getLogger(__name__)
 
 class FrameioUploader(object):
-    def __init__(self, asset: dict, filepath: str, position = None, progress_callback: Callable = None):
+    def __init__(self, asset: dict, filepath: str | Path, position = None, progress_callback: Callable = None):
         self.asset = asset
         self.chunk_size = None
         self.chunk_urls = asset['upload_urls']
@@ -92,13 +93,13 @@ class FrameioUploader(object):
         chunk_offsets = self._calculate_chunks()
         first_chunk_completed = False
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            # Create a task for each chunk
             for chunk_id in range(self.chunks_num):
                 url = self.chunk_urls[chunk_id]
                 chunk_offset = chunk_offsets[chunk_id]
                 task = (url, chunk_offset, chunk_id)
                 future = executor.submit(self._upload_chunk, task)
                 self.futures.append(future)
-            # Keep updating the progress while we have > 0 bytes left.
             # Wait on threads to finish
             for future in concurrent.futures.as_completed(self.futures):
                 try:
